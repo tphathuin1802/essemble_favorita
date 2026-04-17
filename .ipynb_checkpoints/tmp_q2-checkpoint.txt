@@ -1,0 +1,245 @@
+=== CELL 33 [markdown] ===
+## QUESTION 2
+
+=== CELL 34 [markdown] ===
+### 2a. Construct Meaningful Features (OOP Pipeline)
+
+=== CELL 35 [code] ===
+class SalesFeaturePipeline:
+    """
+    A robust feature engineering pipeline optimized for large-scale retail time-series forecasting.
+    
+    Feature 1 ΓÇö Calendar + Cyclical  : day_of_week, is_weekend, day_of_month, month, 
+                                       sin/cos (dow)
+    Feature 2 ΓÇö Event Features       : is_holiday, onpromotion, promo_x_holiday interaction
+    Feature 3 ΓÇö Lag Features         : unit_sales at t-N (grouped per store ├ù item)
+    Feature 4 ΓÇö Rolling Statistics   : rolling mean, std, max over N days 
+                                       (vectorized shift-1 applied ΓåÆ no data leakage)
+    Feature 5 ΓÇö Interaction Features : perishable ├ù cluster, store_type ├ù cluster,
+                                       sales_momentum, promo_proxy indicator
+    Feature 6 ΓÇö Target Encoding      : historical mean sales per cluster & family
+    Feature 7 ΓÇö Memory Optimization  : automatic downcasting to int8/16/32 and float32
+    """
+    
+    def __init__(
+        self,
+        target_column      : str   = 'unit_sales',
+        date_column        : str   = 'date',
+        group_cols         : list  = ['store_nbr', 'item_nbr'],
+        lags               : list  = [1, 2, 3, 4],
+        windows            : list  = [2, 3, 4],
+        momentum_threshold : float = 1.5,
+        holiday_dates      : list  = None
+    ):
+        self.target_column      = target_column
+        self.date_column        = date_column
+        self.group_cols         = group_cols
+        self.lags               = lags
+        self.windows            = windows
+        self.momentum_threshold = momentum_threshold
+        self._cluster_mean_map  = None
+        self._family_mean_map   = None
+        self.holiday_dates      = set(holiday_dates) if holiday_dates else set()
+
+    def fit(self, df):
+        """
+        Fits static target encoding maps based on the training data to avoid data leakage.
+        """
+        self._cluster_mean_map = df.groupby('cluster')[self.target_column].mean().rename
+
+=== CELL 36 [code] ===
+jan_feb_holidays = [
+    '2017-01-01', # New Year's Day
+    '2017-01-02', # Transferred Holiday 
+    '2017-02-27', # Carnival Day 1
+    '2017-02-28'  # Carnival Day 2
+]
+
+pipeline = SalesFeaturePipeline(
+    target_column='unit_sales',
+    date_column='date',
+    group_cols=['store_nbr', 'item_nbr'],
+    lags=[1, 2, 3],
+    windows=[2, 3],
+    momentum_threshold=1.5,
+    holiday_dates=jan_feb_holidays  
+)
+
+df_fe = pipeline.fit_transform(df)
+df_orig = df.copy()
+
+print(f"Original columns  : {df_orig.shape[1]}")
+print(f"Engineered columns: {df_fe.shape[1]}")
+print(f"New features added: {df_fe.shape[1] - df_orig.shape[1]}\n")
+
+summary = pipeline.feature_summary(df_orig, df_fe)
+print("Engineered Feature Summary")
+display(summary)
+
+=== CELL 37 [code] ===
+store_features = df.groupby('store_nbr').agg(
+total_sales      = ('unit_sales', 'sum'),
+mean_sales       = ('unit_sales', 'mean'),
+median_sales     = ('unit_sales', 'median'),
+std_sales        = ('unit_sales', 'std'),
+max_sales        = ('unit_sales', 'max'),
+n_items          = ('item_nbr', 'nunique'),
+n_transactions   = ('unit_sales', 'count'),
+perishable_ratio = ('perishable', 'mean'),
+store_type       = ('store_type', 'first'),
+cluster_id       = ('cluster', 'first'),
+n_families       = ('family', 'nunique')
+).fillna(0).reset_index()
+
+store_features['sales_per_item'] = store_features['total_sales'] / (store_features['n_items'] + 1e-6)
+store_features['cv_sales']       = store_features['std_sales']   / (store_features['mean_sales'] + 1e-6)
+
+store_features = pd.get_dummies(store_features, columns=['store_type'], drop_first=False)
+
+print(f"Store-level feature matrix: {store_features.shape}")
+display(store_features.head(10))
+
+=== CELL 38 [code] ===
+feature_cols = [c for c in store_features.columns if c not in ['store_nbr', 'cluster_id']]
+
+X = store_features[feature_cols].values
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+print("Feature matrix shape:", X_scaled.shape)
+print("Features used:", feature_cols)
+
+=== CELL 39 [code] ===
+K_range = range(2, min(10, len(store_features)))
+inertias, sil_scores, db_scores = [], [], []
+
+for k in K_range:
+    km = KMeans(n_clusters=k, random_state=42, n_init=10)
+    labels = km.fit_predict(X_scaled)
+    inertias.append(km.inertia_)
+    sil_scores.append(silhouette_score(X_scaled, labels))
+    db_scores.append(davies_bouldin_score(X_scaled, labels))
+
+fig, axes = plt.subplots(1, 3, figsize=(16, 4))
+fig.suptitle('Optimal K Selection', fontsize=13, fontweight='bold')
+
+axes[0].plot(K_range, inertias, 'bo-', linewidth=2)
+axes[0].set_title('Elbow Method (Inertia)')
+axes[0].set_xlabel('Number of Clusters K')
+axes[0].set_ylabel('Inertia')
+axes[0].grid(axis='y', linestyle='--', alpha=0.5)
+
+axes[1].plot(K_range, sil_scores, 'go-', linewidth=2)
+axes[1].set_title('Silhouette Score (higher = better)')
+axes[1].set_xlabel('Number of Clusters K')
+axes[1].set_ylabel('Silhouette Score')
+axes[1].grid(axis='y', linestyle='--', alpha=0.5)
+
+axes[2].plot(K_range, db_scores, 'ro-', linewidth=2)
+axes[2].set_title('Davies-Bouldin Score (lower = better)')
+axes[2].set_xlabel('Number of Clusters K')
+axes[2].set_ylabel('DB Score')
+axes[2].grid(axis='y', linestyle='--', alpha=0.5)
+
+plt.tight_layout()
+plt.show()
+
+best_k_sil = list(K_range)[sil_scores.index(max(sil_scores))]
+best_k_db  = list(K_range)[db_scores.index(min(db_scores))]
+print(f"Best K by Silhouette : {best_k_sil}  (score={max(sil_scores):.4f})")
+print(f"Best K by Davies-Bouldin: {best_k_db}  (score={min(db_scores):.4f})")
+
+=== CELL 40 [code] ===
+OPTIMAL_K = best_k_sil  
+
+kmeans = KMeans(n_clusters=OPTIMAL_K, random_state=42, n_init=10)
+store_features['cluster_km'] = kmeans.fit_predict(X_scaled)
+
+print(f"KMeans with K={OPTIMAL_K}")
+print(f"Silhouette Score : {silhouette_score(X_scaled, store_features['cluster_km']):.4f}")
+print(f"Davies-Bouldin   : {davies_bouldin_score(X_scaled, store_features['cluster_km']):.4f}")
+print(f"\nCluster distribution:\n{store_features['cluster_km'].value_counts().sort_index().to_string()}")
+
+=== CELL 41 [code] ===
+best_k_sil = list(K_range)[sil_scores.index(max(sil_scores))]
+best_k_db  = list(K_range)[db_scores.index(min(db_scores))]
+print(f"Best K by Silhouette : {best_k_sil}  (score={max(sil_scores):.4f})")
+print(f"Best K by Davies-Bouldin: {best_k_db}  (score={min(db_scores):.4f})")
+
+OPTIMAL_K = best_k_sil
+
+kmeans = KMeans(n_clusters=OPTIMAL_K, random_state=42, n_init=10)
+store_features['cluster_km'] = kmeans.fit_predict(X_scaled)
+
+print(f"KMeans with K={OPTIMAL_K}")
+print(f"Silhouette Score : {silhouette_score(X_scaled, store_features['cluster_km']):.4f}")
+print(f"Davies-Bouldin   : {davies_bouldin_score(X_scaled, store_features['cluster_km']):.4f}")
+print(f"\nCluster distribution:\n{store_features['cluster_km'].value_counts().sort_index().to_string()}")
+
+=== CELL 42 [code] ===
+pca = PCA(n_components=2, random_state=42)
+X_pca = pca.fit_transform(X_scaled)
+
+store_features['pca1'] = X_pca[:, 0]
+store_features['pca2'] = X_pca[:, 1]
+
+fig, ax = plt.subplots(figsize=(10, 7))
+palette = sns.color_palette('Set1', n_colors=OPTIMAL_K)
+
+for cid in sorted(store_features['cluster_km'].unique()):
+    mask = store_features['cluster_km'] == cid
+    ax.scatter(
+        store_features.loc[mask, 'pca1'],
+        store_features.loc[mask, 'pca2'],
+        s=150, color=palette[cid], edgecolors='white',
+        linewidth=0.8, label=f'Cluster {cid}', zorder=3
+    )
+    # Annotate store numbers
+    for _, row in store_features[mask].iterrows():
+        ax.annotate(str(int(row['store_nbr'])),
+                    (row['pca1'], row['pca2']),
+                    fontsize=7, ha='center', va='bottom',
+                    xytext=(0, 5), textcoords='offset points')
+
+centroids_pca = pca.transform(kmeans.cluster_centers_)
+ax.scatter(
+    centroids_pca[:, 0], centroids_pca[:, 1],
+    c='red', marker='X', s=250, zorder=5,
+    edgecolors='black', linewidths=1.2, label='Centroid'
+)
+
+ax.set_title(f'Store Clusters (PCA 2D)  ΓÇö  K={OPTIMAL_K}\n'
+             f'Explained variance: PC1={pca.explained_variance_ratio_[0]*100:.1f}%  '
+             f'PC2={pca.explained_variance_ratio_[1]*100:.1f}%',
+             fontsize=12, fontweight='bold')
+ax.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]*100:.1f}% variance)')
+ax.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]*100:.1f}% variance)')
+ax.legend(title='Cluster')
+ax.grid(linestyle='--', alpha=0.4)
+plt.tight_layout()
+plt.show()
+
+=== CELL 43 [markdown] ===
+| # | Feature(s) | Rationale |
+|---|-----------|-----------|
+| **1** | `day_of_week`, `is_weekend`, `day_of_month`, `month`, `sin_dow`, `cos_dow` | Retail sales exhibit strong **weekly seasonality**. The sine/cosine transformations (`sin_dow`, `cos_dow`) correctly encode the **cyclic continuity** of time, preventing the model from treating Sunday (6) and Monday (0) as distant. `quarter` and `year` were intentionally excluded since the dataset spans only two months, avoiding zero-variance constant features. |
+| **2** | `is_holiday`, `onpromotion`, `promo_x_holiday` | Special events are the primary drivers of extreme sales spikes. `is_holiday` captures localized events like Carnival and New Year. The interaction term `promo_x_holiday` explicitly flags the compounding effect of holidays overlapping with promotions, providing a highly discriminative split signal for tree-based models. |
+| **3** | `lag_1`, `lag_2`, `lag_3` | Sales are heavily **autocorrelated**ΓÇörecent past sales strongly predict the near future. Due to extreme data sparsity in specific store-item pairs, `lag_4` was dynamically dropped. Missing values in the early days of these short lags were explicitly **imputed with 0** to help the model learn "out-of-stock" or "zero-demand" states rather than dropping valuable data arrays. |
+| **4** | `roll_mean_2/3`, `roll_std_2/3`, `roll_max_2/3` | Rolling statistics capture the **local trend level** and **volatility** over the very recent past. Short windows (2-3 days) are specifically optimized for the brief 2-month dataset. All rolling calculations are strictly shifted by 1 day (`shift(1)`) to ensure **zero data leakage** at prediction time. |
+| **5a** | `perishable_x_cluster`, `type_x_cluster_code` | Perishable items require specific cold-chain logistics, and store formats (`store_type`) perform differently depending on the regional demographic (`cluster`). These interaction terms combine product/store characteristics with geographic context into a single, dense
+
+=== CELL 44 [markdown] ===
+### c) Explain how feature engineering can affect model bias and variance in sales forecasting. (0.5 points)
+
+#### Background: The BiasΓÇôVariance Trade-off
+A model's generalisation error decomposes as:
+
+$$\text{Error} = \text{Bias}^2 + \text{Variance} + \text{Irreducible Noise}$$
+
+Through targeted feature engineering, we can actively manipulate this equation to improve predictive performance on retail data:
+
+* **Lag & Rolling Features (Sparsity Handled):** Raw daily sales treat each day as independentΓÇöa poor assumption for retail. Short-window features (`lag_1` to `lag_3`, `roll_mean_2/3`) inject immediate temporal context, substantially cutting **bias**. Furthermore, explicitly imputing missing early lags with $0$ prevents the model from dropping sparse items. This reduces selection bias and stabilizes **variance** by providing a clear "zero-demand" baseline for models like SVR and Decision Trees.
+* **Calendar & Cyclical Features:** Without cyclical encodings (`sin_dow`, `cos_dow`), a model struggles to learn the continuous transition between weeks. By strictly utilizing daily/weekly cycles and intentionally dropping static features like `year` or `quarter` (tailored to our specific 2-month dataset), we strip out zero-variance noise. This prevents unnecessary **variance** inflation while maximizing seasonal **bias** reduction.
+* **Event & Interaction Features (`promo_x_holiday`, `perishable_x_cluster`):** Explicitly flagging holidays and interacting them with promotions drastically reduces the underfitting **bias** during extreme anomaly days. While Tree models discover interactions naturally, explicitly defining them provides distance-based models (like SVR) with dense, non-linear signals. This massively reduces bias but adds slight complexity, making regularization essential to keep **variance** in check.
+* **Target Encoding:** Replacing high-cardinality variables (`cluster`, `family`) with historical mean sales avoids the massive dimensionality explosion of one-h
+
